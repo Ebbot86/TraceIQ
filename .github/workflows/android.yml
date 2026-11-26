@@ -28,25 +28,46 @@ jobs:
         with:
           gradle-version: '8.9'
       - run: bash tests/run.sh
-      - run: gradle --no-daemon :app:assembleDebug
-      - name: Prepare APK
+      - name: Build and sign APK
+        env:
+          TRACEIQ_KEYSTORE_B64: ${{ secrets.TRACEIQ_KEYSTORE_B64 }}
+          TRACEIQ_STORE_PASSWORD: ${{ secrets.TRACEIQ_STORE_PASSWORD }}
+          TRACEIQ_KEY_ALIAS: ${{ secrets.TRACEIQ_KEY_ALIAS }}
+          TRACEIQ_KEY_PASSWORD: ${{ secrets.TRACEIQ_KEY_PASSWORD }}
         run: |
+          set -euo pipefail
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/TraceIQ-1.3.0-test.apk
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose dist/TraceIQ-1.3.0-test.apk
-          (cd dist && sha256sum TraceIQ-1.3.0-test.apk > SHA256SUMS.txt)
+          if [[ -z "$TRACEIQ_KEYSTORE_B64$TRACEIQ_STORE_PASSWORD$TRACEIQ_KEY_ALIAS$TRACEIQ_KEY_PASSWORD" ]]; then
+            gradle --no-daemon :app:assembleDebug
+            cp app/build/outputs/apk/debug/app-debug.apk dist/TraceIQ-1.4.0-test.apk
+            echo "DEBUG TEST SIGNATURE" > dist/SIGNING.txt
+          else
+            : "${TRACEIQ_KEYSTORE_B64:?Missing keystore}" "${TRACEIQ_STORE_PASSWORD:?Missing store password}" "${TRACEIQ_KEY_ALIAS:?Missing alias}" "${TRACEIQ_KEY_PASSWORD:?Missing key password}"
+            umask 077
+            KEYSTORE="$(mktemp)"
+            trap 'rm -f "$KEYSTORE"' EXIT
+            printf '%s' "$TRACEIQ_KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
+            gradle --no-daemon :app:assembleRelease
+            "$ANDROID_HOME/build-tools/35.0.0/zipalign" -f -p 4 app/build/outputs/apk/release/app-release-unsigned.apk "$RUNNER_TEMP/traceiq-aligned.apk"
+            "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign --ks "$KEYSTORE" --ks-key-alias "$TRACEIQ_KEY_ALIAS" --ks-pass env:TRACEIQ_STORE_PASSWORD --key-pass env:TRACEIQ_KEY_PASSWORD --out dist/TraceIQ-1.4.0-test.apk "$RUNNER_TEMP/traceiq-aligned.apk"
+            echo "PERSISTENT RELEASE SIGNATURE" > dist/SIGNING.txt
+          fi
+      - name: Verify APK
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs dist/TraceIQ-1.4.0-test.apk
+          (cd dist && sha256sum TraceIQ-1.4.0-test.apk > SHA256SUMS.txt)
       - uses: actions/upload-artifact@v4
         with:
-          name: TraceIQ-1.3.0-debug-APK
+          name: TraceIQ-1.4.0-debug-APK
           path: dist/
           if-no-files-found: error
       - name: Publish test release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v1.3.0-test-${GITHUB_RUN_NUMBER}"
+          TAG="v1.4.0-test-${GITHUB_RUN_NUMBER}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release already exists; not replacing its APK."
           else
-            gh release create "$TAG" dist/TraceIQ-1.3.0-test.apk dist/SHA256SUMS.txt --target "$GITHUB_SHA" --prerelease --title "TraceIQ 1.3.0 – Test ${GITHUB_RUN_NUMBER}" --notes "Android test build. Debug signing only; subsequent builds may require uninstalling the previous test app. No stable in-app updates yet."
+            gh release create "$TAG" dist/TraceIQ-1.4.0-test.apk dist/SHA256SUMS.txt dist/SIGNING.txt --target "$GITHUB_SHA" --prerelease --title "TraceIQ 1.4.0 – Test ${GITHUB_RUN_NUMBER}" --notes "Android test build. See SIGNING.txt for signature type. Changing signing keys requires uninstalling the previous app. No in-app installer yet."
           fi
